@@ -1,0 +1,25 @@
+[package]
+name = "counter"
+version = "0.1.0"
+authors = ["nebelgrau"]
+edition = "2018"
+
+[dependencies]
+cortex-m = "0.6.1"
+cortex-m-rt = "0.6.10"
+panic-halt = "0.2.0"
+bare-metal = { version = "0.2", features = ["const-fn"] }
+cast = { version = "0.2", default-features = false }
+void = { version = "1.0", default-features = false }
+ssd1306 = "0.3"
+stm32f0xx-hal = {version = "0.15.2", features = ["stm32f051", "rt"]}
+embedded-hal = { version = "0.2", features = ["unproven"] }
+stm32f0 = "0.9"
+nb = "0.1"
+arrayvec = {version = "0.5.1", default-features = false}
+
+
+[profile.release]
+debug = true
+lto = true
+opt-level = "z"
