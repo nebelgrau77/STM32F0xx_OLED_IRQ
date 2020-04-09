@@ -1,5 +1,7 @@
 # STM32F0 time counter
 
+Shows the elapsed time in HH:MM:SS format, until it overflows (after 18 hours)
+
 Time keeping is done with an interrupt. Every time the interrupt fires, the counter's current value
 is displayed and then updated. Uses SSD1306 OLED in TerminalMode.
 
