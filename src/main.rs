@@ -1,4 +1,5 @@
 //! simple time counter, controlled by an IRQ
+//! pressing the button resets the counter
 
 #![no_std]
 #![no_main]
@@ -24,29 +25,104 @@ use crate::hal::{
     prelude::*,
     i2c::I2c,
     delay::Delay,
-    stm32::{self, interrupt, Interrupt, Peripherals, TIM3},
+    stm32::{self, interrupt, Interrupt, Peripherals, TIM3, TIM2},
     time::Hertz,
     timers::*,
+    gpio::{gpioa::PA0, Input, PullUp},
 };
 
 //globally accessible counter value
 
 static COUNTER: Mutex<Cell<u16>> = Mutex::new(Cell::new(0u16));
 
-//globally accessible timer and display peripherals
+//globally accessible timer2 and peripherals
 
-static GTIMER: Mutex<RefCell<Option<Timer<TIM3>>>> = Mutex::new(RefCell::new(None));
+static G_DISPTIMER: Mutex<RefCell<Option<Timer<TIM3>>>> = Mutex::new(RefCell::new(None));
+static G_BTNTIMER: Mutex<RefCell<Option<Timer<stm32::TIM2>>>> = Mutex::new(RefCell::new(None));
 
-static GDISPLAY: Mutex<RefCell<Option<ssd1306::mode::terminal::TerminalMode
+static G_DISPLAY: Mutex<RefCell<Option<ssd1306::mode::terminal::TerminalMode
     <ssd1306::interface::i2c::I2cInterface<hal::i2c::I2c<hal::stm32::I2C1, 
     hal::gpio::gpiob::PB8<hal::gpio::Alternate<hal::gpio::AF1>>, 
     hal::gpio::gpiob::PB7<hal::gpio::Alternate<hal::gpio::AF1>>>>>>>> = Mutex::new(RefCell::new(None));
 
+static G_BUTTON: Mutex<RefCell<Option<PA0<Input<PullUp>>>>> = Mutex::new(RefCell::new(None));
+    
+// globally accessible flags for the button state (pressed/not pressed)
+
+static STATE1: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static STATE2: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+    
 
 //delay necessary for the I2C to initiate correctly and start on boot without having to reset the board
 
 const BOOT_DELAY_MS: u16 = 200;
 
+#[entry]
+fn main() -> ! {
+
+    let mut p = Peripherals::take().unwrap();
+    let mut cp = c_m_Peripherals::take().unwrap();
+        
+    cortex_m::interrupt::free(move |cs| {
+    
+        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
+            
+        let mut delay = Delay::new(cp.SYST, &rcc);
+    
+        delay.delay_ms(BOOT_DELAY_MS);
+        
+        let gpiob = p.GPIOB.split(&mut rcc);
+        let scl = gpiob.pb8.into_alternate_af1(cs);
+        let sda = gpiob.pb7.into_alternate_af1(cs);
+        let i2c = I2c::i2c1(p.I2C1, (scl, sda), 400.khz(), &mut rcc);
+            
+        // Set up a timer for display update expiring after 1s
+        let mut disptimer = Timer::tim3(p.TIM3, Hertz(1), &mut rcc);
+        disptimer.listen(Event::TimeOut);
+
+        // Move the timer into the global storage
+        *G_DISPTIMER.borrow(cs).borrow_mut() = Some(disptimer);
+
+        // Set up a timer for button state control expiring after 50ms
+        let mut btntimer = Timer::tim2(p.TIM2, Hertz(20), &mut rcc);
+        btntimer.listen(Event::TimeOut);
+
+        // Move the timer into the global storage
+        *G_BTNTIMER.borrow(cs).borrow_mut() = Some(btntimer);
+
+        // set up a button
+        let gpioa = p.GPIOA.split(&mut rcc);
+        let button = gpioa.pa0.into_pull_up_input(cs);
+
+        // Move the button into the global storage
+        *G_BUTTON.borrow(cs).borrow_mut() = Some(button);
+        
+        // Set up the display
+            
+        let mut disp: TerminalMode<_> = SSD1306Builder::new().size(DisplaySize::Display128x32).connect_i2c(i2c).into();
+
+        disp.init().unwrap();
+        disp.clear().unwrap();
+
+        // move the display into the global storage
+        *G_DISPLAY.borrow(cs).borrow_mut() = Some(disp);
+
+        let mut nvic = cp.NVIC;
+        unsafe {
+            nvic.set_priority(Interrupt::TIM3, 1);
+            nvic.set_priority(Interrupt::TIM2, 2);
+            cortex_m::peripheral::NVIC::unmask(Interrupt::TIM3);
+            cortex_m::peripheral::NVIC::unmask(Interrupt::TIM2);
+              
+            }
+            cortex_m::peripheral::NVIC::unpend(Interrupt::TIM3);
+            cortex_m::peripheral::NVIC::unpend(Interrupt::TIM2);
+
+        });
+    
+    loop {continue;}
+    
+}
 
 
 #[interrupt]
@@ -58,19 +134,19 @@ fn TIM3() {
     hal::gpio::gpiob::PB8<hal::gpio::Alternate<hal::gpio::AF1>>, 
     hal::gpio::gpiob::PB7<hal::gpio::Alternate<hal::gpio::AF1>>>>>> = None;
     
-    static mut TIMER: Option<Timer<TIM3>> = None;
+    static mut DISP_TIMER: Option<Timer<TIM3>> = None;
 
-    let int = TIMER.get_or_insert_with(|| {
+    let int = DISP_TIMER.get_or_insert_with(|| {
         cortex_m::interrupt::free(|cs| {
             // Move TIMER here, leaving a None in its place
-            GTIMER.borrow(cs).replace(None).unwrap()
+            G_DISPTIMER.borrow(cs).replace(None).unwrap()
         })
     });
     
     let disp = DISPLAY.get_or_insert_with(|| {
         cortex_m::interrupt::free(|cs| {
             // Move DISPLAY here, leaving a None in its place
-            GDISPLAY.borrow(cs).replace(None).unwrap()
+            G_DISPLAY.borrow(cs).replace(None).unwrap()
         })
     });
         
@@ -88,60 +164,43 @@ fn TIM3() {
 
 }
 
+#[interrupt]
 
-#[entry]
-fn main() -> ! {
 
-    let mut p = Peripherals::take().unwrap();
-    let mut cp = c_m_Peripherals::take().unwrap();
+fn TIM2() {
         
-    cortex_m::interrupt::free(move |cs| {
+    static mut BTN_TIMER: Option<Timer<TIM2>> = None;
+    static mut BTN: Option<PA0<Input<PullUp>>> = None;
+
+    let int = BTN_TIMER.get_or_insert_with(|| {
+        cortex_m::interrupt::free(|cs| {
+            // Move TIMER here, leaving a None in its place
+            G_BTNTIMER.borrow(cs).replace(None).unwrap()
+        })
+    });
     
-        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
-            
-        let mut delay = Delay::new(cp.SYST, &rcc);
+    let button = BTN.get_or_insert_with(|| {
+        cortex_m::interrupt::free(|cs| {
+            // Move BTN here, leaving a None in its place
+            G_BUTTON.borrow(cs).replace(None).unwrap()
+        })
+    });
+
     
+    let state1 = free(|cs| STATE1.borrow(cs).get());
+    let state2 = free(|cs| STATE2.borrow(cs).get());
     
-        delay.delay_ms(BOOT_DELAY_MS);
+    let current = button.is_high().unwrap(); //button pressed?
+
+    if (current == false) && (state1 == true) && (state2 == true) { //if button NOT pressed and both previous states were true
+        free(|cs| COUNTER.borrow(cs).set(0)); //reset the timer
+        }
         
-        let gpiob = p.GPIOB.split(&mut rcc);
-        let scl = gpiob.pb8.into_alternate_af1(cs);
-        let sda = gpiob.pb7.into_alternate_af1(cs);
-        let i2c = I2c::i2c1(p.I2C1, (scl, sda), 400.khz(), &mut rcc);
-            
-        // Set up a timer expiring after 1s
-        let mut timer = Timer::tim3(p.TIM3, Hertz(1), &mut rcc);
-            
-        timer.listen(Event::TimeOut);
+    free(|cs| STATE1.borrow(cs).replace(state2)); //shift the previous state into the past
+    free(|cs| STATE2.borrow(cs).replace(current));
 
-        // Move the timer into the global storage
-        *GTIMER.borrow(cs).borrow_mut() = Some(timer);
-            
+    int.wait().ok();
 
-        // Set up the display
-            
-        let mut disp: TerminalMode<_> = SSD1306Builder::new().size(DisplaySize::Display128x32).connect_i2c(i2c).into();
-            
-        disp.init().unwrap();
-
-        disp.clear().unwrap();
-
-        // move the display into the global storage
-
-        *GDISPLAY.borrow(cs).borrow_mut() = Some(disp);
-
-        let mut nvic = cp.NVIC;
-        unsafe {
-            nvic.set_priority(Interrupt::TIM3, 1);
-            cortex_m::peripheral::NVIC::unmask(Interrupt::TIM3);
-              
-            }
-            cortex_m::peripheral::NVIC::unpend(Interrupt::TIM3);
-
-        });
-    
-    loop {continue;}
-    
 }
 
    
